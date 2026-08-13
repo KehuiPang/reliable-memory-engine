@@ -31,6 +31,11 @@ class IndexedReliableMemory(ReliableMemoryEngine):
         self.index.hnsw.efSearch = 50
         self.item2slot = []      # 索引项id → 知识槽下标
         self._n_items = 0
+        # faiss 不支持高效删除:feedback/sleep 移除槽时不物理删,改软删除(记下标),
+        # 检索时跳过。避免 pop 导致 item2slot 里所有 slot_id 整体错位。
+        self.dead_slots = set()
+        # 脏标记:有写入/更新/软删除后置 True,供定时自动 save 判断是否需落盘
+        self._dirty = False
 
     def _add_keys_to_index(self, slot_id, keys):
         vecs = np.asarray(keys, dtype=np.float32)
@@ -41,14 +46,24 @@ class IndexedReliableMemory(ReliableMemoryEngine):
 
     # 覆写 learn:写入后把它的所有key加进索引
     def learn(self, question, answer, source="user", paraphrases=None):
-        n_before = len(self.slots)
+        # 快照:记录本次 learn 之前各槽的 key 数量,用于精确定位 updated 追加的新 key
+        keycnt_before = [len(s.keys) for s in self.slots]
         ok, msg = super().learn(question, answer, source, paraphrases)
         if not ok:
             return ok, msg
-        # updated(更新旧槽)不新增slot,但可能加了新key;简单起见:updated时重建该槽的key不入索引(旧key已在)
         if msg.startswith("learned"):
+            # 新增槽:把它的所有 key 入索引
             slot_id = len(self.slots) - 1
             self._add_keys_to_index(slot_id, self.slots[slot_id].keys)
+        elif msg.startswith("updated"):
+            # 更新旧槽:父类给某个已有槽的 keys 追加了新 key,须把新增 key 补进索引,
+            # 否则用新问法检索时 faiss 里没有对应向量 → 命中不到(遗留 bug 修复)
+            for sid, cnt_before in enumerate(keycnt_before):
+                cnt_now = len(self.slots[sid].keys)
+                if cnt_now > cnt_before:
+                    new_keys = self.slots[sid].keys[cnt_before:]
+                    self._add_keys_to_index(sid, new_keys)
+        self._dirty = True
         return ok, msg
 
     # 覆写 recall:用HNSW找候选,再走三重门(门逻辑复用父类)
@@ -63,9 +78,13 @@ class IndexedReliableMemory(ReliableMemoryEngine):
             if item_id < 0:
                 continue
             slot_id = self.item2slot[int(item_id)]
+            if slot_id in self.dead_slots:   # 软删除的槽:跳过
+                continue
             sim = float(sim)
             if slot_id not in cand_slot_sim or sim > cand_slot_sim[slot_id]:
                 cand_slot_sim[slot_id] = sim
+        if not cand_slot_sim:   # 候选全被软删除
+            return "[我不确定/需要查证]", {"decision": "abstain", "reason": "empty"}
         # 取候选里相似度最高的槽
         bi = max(cand_slot_sim, key=cand_slot_sim.get)
         best = cand_slot_sim[bi]
@@ -98,6 +117,52 @@ class IndexedReliableMemory(ReliableMemoryEngine):
         return unit.content, {"decision": "answer", "sim": best, "entity_sim": ent_sim,
                 "conf": unit.confidence, "source": unit.source}
 
+    # ---------- 覆写 feedback:拒绝时软删除(不 pop,避免索引下标错位) ----------
+    def feedback(self, query, accepted=True):
+        if not self.slots or self._n_items == 0:
+            return
+        # 复用索引找最相似的活槽(与 recall 同口径)
+        q = self._encode(query)[0].astype(np.float32)
+        k = min(10, self._n_items)
+        sims_arr, labels = self.index.search(np.asarray([q]), k)
+        cand = {}
+        for item_id, sim in zip(labels[0], sims_arr[0]):
+            if item_id < 0:
+                continue
+            sid = self.item2slot[int(item_id)]
+            if sid in self.dead_slots:
+                continue
+            if sid not in cand or float(sim) > cand[sid]:
+                cand[sid] = float(sim)
+        if not cand:
+            return
+        bi = max(cand, key=cand.get)
+        # 相似度不足 sim_th 说明这条 query 根本不对应该槽,不做反馈(避免误伤邻近槽)
+        if cand[bi] < self.sim_th:
+            return
+        unit = self.slots[bi]
+        if accepted:
+            unit.confidence += 0.15 * (1.0 - unit.confidence)
+        else:
+            unit.confidence *= 0.3
+            if unit.confidence < 0.15:
+                self.dead_slots.add(bi)   # 软删除:标记失效,保留索引映射不错位
+        self._dirty = True
+
+    # ---------- 覆写 sleep:固化后软删除该槽(不重建 slots 列表) ----------
+    def sleep(self, min_hits=2):
+        consolidated = 0
+        for sid, s in enumerate(self.slots):
+            if sid in self.dead_slots:
+                continue
+            if s.hits >= min_hits and s.confidence >= 0.7:
+                self.cortex[s.question] = s.content
+                self.dead_slots.add(sid)
+                consolidated += 1
+        if consolidated:
+            self._dirty = True
+        return consolidated
+
     # ---------- 持久化:save/load(产品化,重启不丢) ----------
     def save(self, path_dir):
         """保存引擎状态到目录:知识元数据(json)+向量(npz)+faiss索引+映射"""
@@ -111,6 +176,7 @@ class IndexedReliableMemory(ReliableMemoryEngine):
                          "n_keys": len(s.keys)})
         with open(os.path.join(path_dir, "meta.json"), "w", encoding="utf-8") as f:
             json.dump({"slots": meta, "item2slot": self.item2slot, "n_items": self._n_items,
+                       "dead_slots": sorted(self.dead_slots),
                        "sim_th": self.sim_th, "entity_th": self.entity_th, "conf_th": self.conf_th,
                        "strong_sim": self.strong_sim, "update_sim": self.update_sim,
                        "cortex": self.cortex, "dim": self.dim}, f, ensure_ascii=False)
@@ -123,6 +189,7 @@ class IndexedReliableMemory(ReliableMemoryEngine):
         np.savez(os.path.join(path_dir, "vectors.npz"), **arrays)
         # 3. faiss索引
         self._faiss.write_index(self.index, os.path.join(path_dir, "index.faiss"))
+        self._dirty = False   # 落盘后清脏标记
         return path_dir
 
     @classmethod
@@ -141,6 +208,7 @@ class IndexedReliableMemory(ReliableMemoryEngine):
                 confidence=m["confidence"], source=m["source"],
                 keys=list(vecs["ks%d" % i]), hits=m["hits"]))
         eng.item2slot = d["item2slot"]; eng._n_items = d["n_items"]
+        eng.dead_slots = set(d.get("dead_slots", []))
         eng.sim_th=d["sim_th"]; eng.entity_th=d["entity_th"]; eng.conf_th=d["conf_th"]
         eng.strong_sim=d["strong_sim"]; eng.update_sim=d["update_sim"]; eng.cortex=d["cortex"]
         # 读回faiss索引(替换__init__建的空索引)

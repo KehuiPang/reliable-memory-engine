@@ -55,8 +55,17 @@ python3 engine/memory_server.py 8899
 curl -X POST :8899/learn  -d '{"tenant":"myapp","question":"...","answer":"..."}'
 # 查它(命中就答,没把握就认怂)
 curl -X POST :8899/recall -d '{"tenant":"myapp","query":"..."}'
+# 探活
+curl :8899/health
 ```
-支持多租户(tenant 隔离)、重启自动恢复。
+支持多租户(tenant 隔离)、重启自动恢复。**生产级加固**(可选,零额外依赖):
+```bash
+MEM_API_KEY=your-secret \      # 设了才启用鉴权,请求带 X-API-Key
+MEM_AUTOSAVE_SEC=60 \          # 每 60s 自动落盘有变更的租户(0=关)
+python3 engine/memory_server.py 8899
+```
+- 鉴权(X-API-Key)、每租户写锁(learn/feedback 串行)、定时自动 save(仅存脏租户)
+- `GET /health` 健康探活、SIGINT/SIGTERM 优雅关闭时先 flush 落盘、缺字段返回 400
 
 ---
 
@@ -79,10 +88,12 @@ curl -X POST :8899/recall -d '{"tenant":"myapp","query":"..."}'
 engine/                         ← 成品引擎(用这个)
   reliable_memory_engine.py       基础引擎(记忆库+三重门+价值度+睡眠固化)
   indexed_engine.py               规模化版(faiss索引 + save/load持久化)
-  memory_server.py                多租户 HTTP 服务
+  memory_server.py                多租户 HTTP 服务(含鉴权/自动save/健康检查加固)
   demo.py                         交互演示(python3 demo.py / -i)
   e2e_compare.py                  裸LLM vs LLM+记忆 端到端对比(需ollama)
   smoke_test.py / scale_perf.py   验收/性能测试
+  test_update_index.py            回归:updated新key入索引/软删除/持久化
+  test_server.py                  回归:HTTP服务鉴权/自动save/优雅关闭
 
 a1_reliable_memory/ ~ a5_entity/  ← 研发过程的分阶段验证(A1记忆库→A2真实鲁棒→
 pc_probe/                            A3睡眠固化→规模化→实体核验;含预测编码探针负结果)
@@ -105,7 +116,7 @@ pc_probe/                            A3睡眠固化→规模化→实体核验;�
 
 - "皮层固化"目前是 dict(真实系统应蒸馏进大模型主干权重,LLM规模固化仍是学界空白)
 - 实体抽取用轻量规则(产品化应上 NER/大模型)
-- 服务无鉴权、单机内存态(生产级需加固:鉴权/并发锁/分布式)
+- 服务已加固鉴权/每租户写锁/自动save/健康检查/优雅关闭,但仍是单机内存态(分布式/限流/监控待做)
 - 小 LLM(如1.5b)可能不会好好利用注入的记忆,换大模型即改善
 
 ---
