@@ -1,0 +1,11 @@
+# 运行产物
+__pycache__/
+*.pyc
+*_results.json
+saved_memory/
+tenant_memory/
+*.faiss
+*.npz
+# 模型缓存(在 ~/.cache,不该进仓,以防万一)
+.cache/
+*.bin

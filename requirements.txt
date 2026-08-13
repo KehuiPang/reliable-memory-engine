@@ -1,0 +1,9 @@
+# 可靠记忆引擎依赖
+# ⚠️ 环境坑(macOS实测):
+#   1) numpy 必须 <2 (faiss会升到2.x,与torch2.0.1冲突导致encode崩)
+#   2) faiss 必须在 torch/sentence-transformers 之后 import (引擎内已延迟处理),
+#      否则macOS下OpenMP冲突段错误
+numpy<2
+torch==2.0.1
+sentence-transformers==2.2.2
+faiss-cpu
