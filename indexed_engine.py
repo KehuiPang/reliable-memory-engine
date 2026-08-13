@@ -119,6 +119,15 @@ class IndexedReliableMemory(ReliableMemoryEngine):
         # ===== 复用父类三重认怂门(逻辑一致) =====
         if best < self.sim_th:
             return "[我不确定/需要查证]", {"decision": "abstain", "reason": "low_sim", "sim": best}
+
+        # 门1.5 margin门(与基础引擎一致):非强命中且候选次高槽间隙过小→"一堆半匹配"→认怂。
+        # faiss 候选里取不同槽的次高相似度(cand_slot_sim 已按槽去重取每槽最高)。
+        if best < self.strong_sim and len(cand_slot_sim) >= 2:
+            second = sorted(cand_slot_sim.values(), reverse=True)[1]
+            margin = best - second
+            if margin < self.margin_th:
+                return "[我不确定/需要查证]", {"decision": "abstain", "reason": "low_margin",
+                        "sim": best, "margin": margin}
         # 门2a 限定词冲突
         qualifiers = ["隔壁", "别的", "别人", "其他", "另一", "另外", "对面", "邻居", "他们的", "别家"]
         q_quals = [w for w in qualifiers if w in query]
@@ -205,6 +214,7 @@ class IndexedReliableMemory(ReliableMemoryEngine):
                        "dead_slots": sorted(self.dead_slots),
                        "sim_th": self.sim_th, "entity_th": self.entity_th, "conf_th": self.conf_th,
                        "strong_sim": self.strong_sim, "update_sim": self.update_sim,
+                       "margin_th": self.margin_th,
                        "cortex": self.cortex, "dim": self.dim}, f, ensure_ascii=False)
         # 2. 向量(key/entity_key/多keys)存npz
         arrays = {}
@@ -237,6 +247,7 @@ class IndexedReliableMemory(ReliableMemoryEngine):
         eng.dead_slots = set(d.get("dead_slots", []))
         eng.sim_th=d["sim_th"]; eng.entity_th=d["entity_th"]; eng.conf_th=d["conf_th"]
         eng.strong_sim=d["strong_sim"]; eng.update_sim=d["update_sim"]; eng.cortex=d["cortex"]
+        eng.margin_th=d.get("margin_th", 0.08)   # 兼容旧存档(无此字段用默认)
         # 读回faiss索引(替换__init__建的空索引)
         eng.index = eng._faiss.read_index(os.path.join(path_dir, "index.faiss"))
         eng._adapt_efsearch()   # 按恢复后的库规模重设搜索深度

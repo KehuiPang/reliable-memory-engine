@@ -28,7 +28,8 @@ class KUnit:
 
 class ReliableMemoryEngine:
     def __init__(self, embed_model="BAAI/bge-small-zh-v1.5",
-                 sim_th=0.45, entity_th=0.55, conf_th=0.5, strong_sim=0.90):
+                 sim_th=0.45, entity_th=0.55, conf_th=0.5, strong_sim=0.90,
+                 margin_th=0.08):
         from sentence_transformers import SentenceTransformer
         self.enc = SentenceTransformer(embed_model)
         self.slots = []
@@ -36,6 +37,12 @@ class ReliableMemoryEngine:
         self.entity_th = entity_th    # 实体核验门(语义级)
         self.conf_th = conf_th        # 可信度门
         self.strong_sim = strong_sim  # 强命中阈值:超过则放宽语义实体核验
+        # 门1.5 margin门(A1核心洞察在真实大模型场景的再次印证):
+        #   最近邻与次近邻的相似度间隙。"真实体+虚构子属性"(如'figcheck项目的首席宇航员')
+        #   会同时半匹配多个槽→margin极小(0.04~0.05);真命中margin明显(≥0.13)。
+        #   实测真实私有知识最小margin 0.13,虚构陷阱0.04~0.05,阈值0.08干净分开、不误伤。
+        #   仅在"非强命中"(best<strong_sim)时启用:强命中是明确唯一匹配,不该被margin拦。
+        self.margin_th = margin_th
         self.update_sim = 0.85        # 更新旧槽阈值
         self.cortex = {}              # 睡眠固化的长期记忆
 
@@ -109,6 +116,14 @@ class ReliableMemoryEngine:
         # 门1 相似度
         if best < self.sim_th:
             return "[我不确定/需要查证]", {"decision": "abstain", "reason": "low_sim", "sim": best}
+
+        # 门1.5 margin门:非强命中时,若与次近邻间隙过小→是"一堆半匹配"(典型虚构子属性),认怂。
+        if best < self.strong_sim and len(sims) >= 2:
+            second = float(np.partition(sims, -2)[-2])   # 次高相似度
+            margin = best - second
+            if margin < self.margin_th:
+                return "[我不确定/需要查证]", {"decision": "abstain", "reason": "low_margin",
+                        "sim": best, "margin": margin}
 
         # 门2a 限定词冲突(隔壁公司的WiFi ≠ 公司WiFi)
         qualifiers = ["隔壁", "别的", "别人", "其他", "另一", "另外", "对面", "邻居", "他们的", "别家"]
