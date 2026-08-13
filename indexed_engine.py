@@ -28,14 +28,39 @@ class IndexedReliableMemory(ReliableMemoryEngine):
         self.dim = dim
         self.index = faiss.IndexHNSWFlat(dim, 16, faiss.METRIC_INNER_PRODUCT)
         self.index.hnsw.efConstruction = 200
-        self.index.hnsw.efSearch = 50
+        # efSearch=检索时搜索深度。万级规模压测(scale_stress.py + _tune_ef.py)实测(512维):
+        #   efSearch=50 在 5万条时 Recall@1 仅 72%(HNSW漏真最近邻→假认怂/漏答);
+        #   且 efSearch 需随库规模上调:5万条 200 够(98%),10万条要 400 才 99%。
+        # 故用 _adapt_efsearch() 按库规模自适应(库越大搜越深),兼顾召回与延迟。
+        self.index.hnsw.efSearch = 200
+        # 注:_adapt_efsearch 在下面 _n_items 初始化后调用(此处 _n_items 尚未定义)
         self.item2slot = []      # 索引项id → 知识槽下标
         self._n_items = 0
+        self._adapt_efsearch()   # 空库先按 n=0 设默认(128),后续 add 时再自适应
         # faiss 不支持高效删除:feedback/sleep 移除槽时不物理删,改软删除(记下标),
         # 检索时跳过。避免 pop 导致 item2slot 里所有 slot_id 整体错位。
         self.dead_slots = set()
         # 脏标记:有写入/更新/软删除后置 True,供定时自动 save 判断是否需落盘
         self._dirty = False
+
+    def _adapt_efsearch(self):
+        """按库规模自适应 efSearch:库越大近似搜索要越深才能保 Recall。
+        实测甜点(512维): ≤1万→128, 5万→256, 10万→400, 上限512。
+        用 log 平滑:ef = clip(round(48*log2(n+1)), 128, 512)。
+        n=1万→~640→截512? 校准取更缓系数,保证 5万≈256/10万≈400。"""
+        import math
+        n = max(getattr(self, "_n_items", 0), 1)
+        ef = int(48 * math.log2(n + 1))         # 1万→~638 偏大;下面按档位校准更稳
+        # 分档校准(与实测甜点对齐,避免 log 系数在中间段偏差)
+        if n <= 2000:
+            ef = 128
+        elif n <= 20000:
+            ef = 200
+        elif n <= 60000:
+            ef = 300
+        else:
+            ef = 400 if n <= 150000 else 512
+        self.index.hnsw.efSearch = ef
 
     def _add_keys_to_index(self, slot_id, keys):
         vecs = np.asarray(keys, dtype=np.float32)
@@ -43,6 +68,7 @@ class IndexedReliableMemory(ReliableMemoryEngine):
         for _ in keys:
             self.item2slot.append(slot_id)
             self._n_items += 1
+        self._adapt_efsearch()   # 库变大后同步调深搜索深度
 
     # 覆写 learn:写入后把它的所有key加进索引
     def learn(self, question, answer, source="user", paraphrases=None):
@@ -213,4 +239,5 @@ class IndexedReliableMemory(ReliableMemoryEngine):
         eng.strong_sim=d["strong_sim"]; eng.update_sim=d["update_sim"]; eng.cortex=d["cortex"]
         # 读回faiss索引(替换__init__建的空索引)
         eng.index = eng._faiss.read_index(os.path.join(path_dir, "index.faiss"))
+        eng._adapt_efsearch()   # 按恢复后的库规模重设搜索深度
         return eng
